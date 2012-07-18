@@ -31,6 +31,7 @@
  *   Andrés J. Díaz <ajdiaz at connectical.com>
  *   Manuel Sanmartin
  *   Clément Stenac <clement.stenac at diwi.org>
+ *   Curtis Ide <curtis at fedback.org>
  **/
 
 #include "collectd.h"
@@ -105,7 +106,7 @@
 #  include <procinfo.h>
 #  include <sys/types.h>
 
-#define MAXPROCENTRY 32
+#define MAXPROCENTRY 64
 #define MAXTHRDENTRY 16
 #define MAXARGLN 1024
 /* #endif HAVE_PROCINFO_H */
@@ -116,6 +117,10 @@
 
 #if HAVE_REGEX_H
 # include <regex.h>
+#endif
+
+#ifndef MAXPROCENTRY
+#define MAXPROCENTRY 64
 #endif
 
 #ifndef ARG_MAX
@@ -152,6 +157,7 @@ typedef struct procstat_entry_s
 	derive_t io_syscw;
 
 	struct procstat_entry_s *next;
+	struct procstat_entry_s *prior;
 } procstat_entry_t;
 
 #define PROCSTAT_NAME_LEN 256
@@ -184,9 +190,12 @@ typedef struct procstat
 
 	struct procstat   *next;
 	struct procstat_entry_s *instances;
+	int top_status;
 } procstat_t;
 
 static procstat_t *list_head_g = NULL;
+static char config_mode_g[256];
+static int process_count_g = 0;
 
 #if HAVE_THREAD_INFO
 static mach_port_t port_host_self;
@@ -234,6 +243,9 @@ static void ps_list_register (const char *name, const char *regexp)
 	memset (new, 0, sizeof (procstat_t));
 	sstrncpy (new->name, name, sizeof (new->name));
 
+	/* set top status to false for all new entries */
+	new->top_status=0;
+
 #if HAVE_REGEX_H
 	if (regexp != NULL)
 	{
@@ -245,6 +257,8 @@ static void ps_list_register (const char *name, const char *regexp)
 			sfree (new);
 			return;
 		}
+		/* set top status to false for all new entries */
+		new->top_status=0;
 
 		status = regcomp (new->re, regexp, REG_EXTENDED | REG_NOSUB);
 		if (status != 0)
@@ -271,11 +285,13 @@ static void ps_list_register (const char *name, const char *regexp)
 	{
 		if (strcmp (ptr->name, name) == 0)
 		{
-			WARNING ("FedBack plugin: You have configured more "
-					"than one `Process' or "
-					"`ProcessMatch' with the same name. "
-					"All but the first setting will be "
-					"ignored.");
+			if ((strcasecmp (config_mode_g, "ProcessesTop") != 0) && (strcasecmp (config_mode_g, "ProcessesAll") != 0)) {
+				WARNING ("FedBack plugin: You have configured more "
+						"than one `Process' or "
+						"`ProcessMatch' with the same name. "
+						"All but the first setting will be "
+						"ignored.");
+			}
 			sfree (new->re);
 			sfree (new);
 			return;
@@ -289,11 +305,34 @@ static void ps_list_register (const char *name, const char *regexp)
 		list_head_g = new;
 	else
 		ptr->next = new;
+	
+	process_count_g += 1;
+
+	WARNING ("FedBack plugin: added process %s to list.",name);
 } /* void ps_list_register */
 
 /* try to match name against entry, returns 1 if success */
 static int ps_list_match (const char *name, const char *cmdline, procstat_t *ps)
 {
+	procstat_t *ptr;
+	int matched;
+	/* if monitoring all or top processes, any process name is a match */
+	if ((strcasecmp (config_mode_g, "ProcessesAll") == 0) || (strcasecmp (config_mode_g, "ProcessesTop") == 0)) {
+		matched = 0;
+		/* add each process to the process list so that stats are saved */
+		for (ptr = list_head_g; ptr != NULL; ptr = ptr->next)
+		{
+			if (strcmp (ptr->name, name) == 0)
+				matched = 1;
+		}
+		if ((matched == 0) && (process_count_g <= MAXPROCENTRY)) {
+			ps_list_register (name, NULL);
+			return (1);
+		}
+		else {
+			return (0);
+		}
+	}
 #if HAVE_REGEX_H
 	if (ps->re != NULL)
 	{
@@ -326,6 +365,7 @@ static void ps_list_add (const char *name, const char *cmdline, procstat_entry_t
 {
 	procstat_t *ps;
 	procstat_entry_t *pse;
+	procstat_entry_t *pse_prior = NULL;
 
 	if (entry->id == 0)
 		return;
@@ -335,9 +375,10 @@ static void ps_list_add (const char *name, const char *cmdline, procstat_entry_t
 		if ((ps_list_match (name, cmdline, ps)) == 0)
 			continue;
 
-		for (pse = ps->instances; pse != NULL; pse = pse->next)
+		for (pse = ps->instances; pse != NULL; pse = pse->next) {
 			if ((pse->id == entry->id) || (pse->next == NULL))
 				break;
+		}
 
 		if ((pse == NULL) || (pse->id != entry->id))
 		{
@@ -354,9 +395,11 @@ static void ps_list_add (const char *name, const char *cmdline, procstat_entry_t
 			else
 				pse->next = new;
 
+			pse_prior = pse;
 			pse = new;
 		}
 
+		pse->prior = pse_prior;
 		pse->age = 0;
 		pse->num_proc   = entry->num_proc;
 		pse->num_lwp    = entry->num_lwp;
@@ -517,12 +560,14 @@ static void ps_list_reset (void)
 static int ps_config (oconfig_item_t *ci)
 {
 	int i;
+	sstrncpy(config_mode_g,"",sizeof(""));
 
 	for (i = 0; i < ci->children_num; ++i) {
 		oconfig_item_t *c = ci->children + i;
 
 		if (strcasecmp (c->key, "Process") == 0)
 		{
+			sstrncpy(config_mode_g,"Process",sizeof("Process"));
 			if ((c->values_num != 1)
 					|| (OCONFIG_TYPE_STRING != c->values[0].type)) {
 				ERROR ("FedBack plugin: `Process' expects exactly "
@@ -542,6 +587,7 @@ static int ps_config (oconfig_item_t *ci)
 		}
 		else if (strcasecmp (c->key, "ProcessMatch") == 0)
 		{
+			sstrncpy(config_mode_g,"ProcessMatch",sizeof("ProcessMatch"));
 			if ((c->values_num != 2)
 					|| (OCONFIG_TYPE_STRING != c->values[0].type)
 					|| (OCONFIG_TYPE_STRING != c->values[1].type))
@@ -563,6 +609,34 @@ static int ps_config (oconfig_item_t *ci)
 			ps_list_register (c->values[0].value.string,
 					c->values[1].value.string);
 		}
+		else if (strcasecmp (c->key, "Processes") == 0)
+		{
+			if ((c->values_num != 1)
+					|| (OCONFIG_TYPE_STRING != c->values[0].type)) {
+				WARNING ("FedBack plugin: `Processes' needs exactly "
+						"one string argument (got %i).",
+						c->values_num);
+				continue;
+			}
+			else if (strcasecmp (c->values[0].value.string, "All") == 0) {
+				sstrncpy(config_mode_g,"ProcessesAll",sizeof("ProcessesAll"));
+			}
+			else if (strcasecmp (c->values[0].value.string, "Top") == 0) {
+				sstrncpy(config_mode_g,"ProcessesTop",sizeof("ProcessesTop"));
+			}
+			else {
+				WARNING ("FedBack plugin: `Processes' needs exactly "
+						"one string argument with value All or Top (got %s).",
+						c->values[0].value.string);
+			}
+
+			if (c->children_num != 0) {
+				WARNING ("FedBack plugin: the `Processes' config option "
+						"does not expect any child elements -- ignoring "
+						"content (%i elements) of the <Process '%s'> block.",
+						c->children_num, c->values[0].value.string);
+			}
+		}
 		else
 		{
 			ERROR ("FedBack plugin: The `%s' configuration option is not "
@@ -570,6 +644,7 @@ static int ps_config (oconfig_item_t *ci)
 			continue;
 		}
 	}
+	WARNING ("FedBack plugin: `Processes' set mode %s", config_mode_g);
 
 	return (0);
 }
@@ -1289,6 +1364,7 @@ static int ps_read (void)
 						&task_pid,
 						task_name, PROCSTAT_NAME_LEN) == 0)
 			{
+				ERROR ("got task name: %s\n", task_name);
 				/* search for at least one match */
 				for (ps = list_head_g; ps != NULL; ps = ps->next)
 					/* FIXME: cmdline should be here instead of NULL */
