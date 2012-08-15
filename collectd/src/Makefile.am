@@ -951,8 +951,8 @@ endif
 
 if BUILD_PLUGIN_FEDBACK
 pkglib_LTLIBRARIES += FedBack.la
-FedBack_la_SOURCES = FedBack.c
-FedBack_la_LDFLAGS = -module -avoid-version
+FedBack_la_SOURCES = FedBack.c FedBack.h
+FedBack_la_LDFLAGS = -module -avoid-version -lm
 FedBack_la_LIBADD =
 collectd_LDADD += "-dlopen" FedBack.la
 collectd_DEPENDENCIES += FedBack.la

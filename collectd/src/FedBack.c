@@ -39,6 +39,15 @@
 #include "plugin.h"
 #include "configfile.h"
 
+#define FEDBACK_PLUGIN_NAME	"FedBack"
+
+#define	ALL_PROCESSES		1
+#define	MATCHED_PROCESS		10
+#define TOP_PROCESSES		100
+
+#define MOVING_AVERAGE_PERIOD	20
+
+
 /* Include header files for the mach system, if they exist.. */
 #if HAVE_THREAD_INFO
 #  if HAVE_MACH_MACH_INIT_H
@@ -86,6 +95,7 @@
 /* #endif HAVE_THREAD_INFO */
 
 #elif KERNEL_LINUX
+#  include <math.h>
 #  if HAVE_LINUX_CONFIG_H
 #    include <linux/config.h>
 #  endif
@@ -106,7 +116,7 @@
 #  include <procinfo.h>
 #  include <sys/types.h>
 
-#define MAXPROCENTRY 64
+#define MAXPROCENTRY 32
 #define MAXTHRDENTRY 16
 #define MAXARGLN 1024
 /* #endif HAVE_PROCINFO_H */
@@ -120,7 +130,7 @@
 #endif
 
 #ifndef MAXPROCENTRY
-#define MAXPROCENTRY 64
+#define MAXPROCENTRY 32
 #endif
 
 #ifndef ARG_MAX
@@ -157,7 +167,6 @@ typedef struct procstat_entry_s
 	derive_t io_syscw;
 
 	struct procstat_entry_s *next;
-	struct procstat_entry_s *prior;
 } procstat_entry_t;
 
 #define PROCSTAT_NAME_LEN 256
@@ -187,15 +196,46 @@ typedef struct procstat
 	derive_t io_wchar;
 	derive_t io_syscr;
 	derive_t io_syscw;
+	
+	/* FedBack data */
+	int top_status;
+
+	/* averages */
+	unsigned long avg_num_proc;
+	unsigned long avg_num_lwp;
+	unsigned long avg_vmem_size;
+	unsigned long avg_vmem_rss;
+	unsigned long avg_vmem_data;
+	unsigned long avg_vmem_code;
+	unsigned long avg_stack_size;
+
+	unsigned long avg_vmem_minflt;
+	unsigned long avg_vmem_majflt;
+	derive_t      avg_vmem_minflt_counter;
+	derive_t      avg_vmem_majflt_counter;
+
+	unsigned long avg_cpu_user;
+	unsigned long avg_cpu_system;
+	derive_t      avg_cpu_user_counter;
+	derive_t      avg_cpu_system_counter;
+
+	derive_t avg_io_rchar;
+	derive_t avg_io_wchar;
+	derive_t avg_io_syscr;
+	derive_t avg_io_syscw;
 
 	struct procstat   *next;
 	struct procstat_entry_s *instances;
-	int top_status;
 } procstat_t;
 
 static procstat_t *list_head_g = NULL;
-static char config_mode_g[256];
+static int config_mode_g;
 static int process_count_g = 0;
+static int avg_process_count_g = 0;
+static int top_process_count_g = 0;
+static int avg_top_process_count_g = 0;
+static cdtime_t now_g = 0;
+static cdtime_t then_g = 0;
 
 #if HAVE_THREAD_INFO
 static mach_port_t port_host_self;
@@ -207,6 +247,7 @@ static mach_msg_type_number_t     pset_list_len;
 
 #elif KERNEL_LINUX
 static long pagesize_g;
+static unsigned long avg_fork_rate_g = 0;
 /* #endif KERNEL_LINUX */
 
 #elif HAVE_LIBKVM_GETPROCS && HAVE_STRUCT_KINFO_PROC_FREEBSD
@@ -225,10 +266,36 @@ int     getthrds64( pid_t, void *, int, tid64_t *, int );
 int getargs (struct procentry64 *processBuffer, int bufferLen, char *argsBuffer, int argsLen);
 #endif /* HAVE_PROCINFO_H */
 
+/* Calculate Moving Averages */
+
+/* from wikipedia:
+Moving Average to measuring computer performance.  Some computer performance metrics, e.g. the average process queue length, or the average CPU utilization, use a form of exponential moving average.
+
+    S_n = alpha(t_[n]-t_[n-1]) * Y_n + (1-alpha(t_[n]-t_[n-1])) * S_[n-1].
+
+Here alpha is defined as a function of time between two readings. An example of a coefficient giving bigger weight to the current reading, and smaller weight to the older readings is
+
+    alpha(t_[n]-t_[n-1]) = 1-exp(([-[ [t_[n]-t_[n-1]] / [W * 60] ]]))
+
+where time for readings tn is expressed in seconds, and W is the period of time in minutes over which the reading is said to be averaged (the mean lifetime of each reading in the average). Given the above definition of alpha, the moving average can be expressed as
+
+    S[n] = (1-exp(((-( (t[n] - t[n-1]) / (W * 60)))))) * Y[n] + e^(-((t[n]-t[n-1]) / (W * 60))) * S[n-1] 
+*/
+static double ewma_average(double current, double last_average) {
+double average = 0;
+double e=2.7182818285;
+	average = (1-exp(((-((double)(now_g-then_g)/(MOVING_AVERAGE_PERIOD)))))) * 
+	current + pow(e,((-((double)(now_g-then_g)/(MOVING_AVERAGE_PERIOD))) * last_average)); 
+	DEBUG("FedBack moving average - now: %.3f current: %.3f then: %.3f last_avg: %.3f",
+		CDTIME_T_TO_DOUBLE(now_g),current, CDTIME_T_TO_DOUBLE(then_g),last_average);
+
+    return(average);
+}
+
 /* put name of process from config to list_head_g tree
    list_head_g is a list of 'procstat_t' structs with
    processes names we want to watch */
-static void ps_list_register (const char *name, const char *regexp)
+static void ps_list_register (const char *name, const char *regexp, int mode)
 {
 	procstat_t *new;
 	procstat_t *ptr;
@@ -243,8 +310,8 @@ static void ps_list_register (const char *name, const char *regexp)
 	memset (new, 0, sizeof (procstat_t));
 	sstrncpy (new->name, name, sizeof (new->name));
 
-	/* set top status to false for all new entries */
-	new->top_status=0;
+	/* set top status for new entries */
+	new->top_status = 0;
 
 #if HAVE_REGEX_H
 	if (regexp != NULL)
@@ -257,8 +324,6 @@ static void ps_list_register (const char *name, const char *regexp)
 			sfree (new);
 			return;
 		}
-		/* set top status to false for all new entries */
-		new->top_status=0;
 
 		status = regcomp (new->re, regexp, REG_EXTENDED | REG_NOSUB);
 		if (status != 0)
@@ -285,12 +350,10 @@ static void ps_list_register (const char *name, const char *regexp)
 	{
 		if (strcmp (ptr->name, name) == 0)
 		{
-			if ((strcasecmp (config_mode_g, "ProcessesTop") != 0) && (strcasecmp (config_mode_g, "ProcessesAll") != 0)) {
+			if (mode == MATCHED_PROCESS) {
 				WARNING ("FedBack plugin: You have configured more "
-						"than one `Process' or "
-						"`ProcessMatch' with the same name. "
-						"All but the first setting will be "
-						"ignored.");
+						"than one 'ProcessMatch' with the same name. "
+						"All but the first setting will be ignored.");
 			}
 			sfree (new->re);
 			sfree (new);
@@ -308,7 +371,18 @@ static void ps_list_register (const char *name, const char *regexp)
 	
 	process_count_g += 1;
 
-	WARNING ("FedBack plugin: added process %s to list.",name);
+	/* set top status */
+	if (mode == MATCHED_PROCESS) {
+		new->top_status = mode;
+		top_process_count_g += 1;
+	}
+	else if (mode == ALL_PROCESSES) {
+		new->top_status = mode;
+		top_process_count_g += 1;
+	}
+
+	WARNING ("FedBack plugin: mode: %d added process %s %s to list with mode %d",
+		mode, name, regexp, mode);
 } /* void ps_list_register */
 
 /* try to match name against entry, returns 1 if success */
@@ -317,7 +391,7 @@ static int ps_list_match (const char *name, const char *cmdline, procstat_t *ps)
 	procstat_t *ptr;
 	int matched;
 	/* if monitoring all or top processes, any process name is a match */
-	if ((strcasecmp (config_mode_g, "ProcessesAll") == 0) || (strcasecmp (config_mode_g, "ProcessesTop") == 0)) {
+	if ((config_mode_g == TOP_PROCESSES) || (config_mode_g == ALL_PROCESSES)) {
 		matched = 0;
 		/* add each process to the process list so that stats are saved */
 		for (ptr = list_head_g; ptr != NULL; ptr = ptr->next)
@@ -326,7 +400,7 @@ static int ps_list_match (const char *name, const char *cmdline, procstat_t *ps)
 				matched = 1;
 		}
 		if ((matched == 0) && (process_count_g <= MAXPROCENTRY)) {
-			ps_list_register (name, NULL);
+			ps_list_register (name, NULL, config_mode_g);
 			return (1);
 		}
 		else {
@@ -365,7 +439,6 @@ static void ps_list_add (const char *name, const char *cmdline, procstat_entry_t
 {
 	procstat_t *ps;
 	procstat_entry_t *pse;
-	procstat_entry_t *pse_prior = NULL;
 
 	if (entry->id == 0)
 		return;
@@ -375,10 +448,9 @@ static void ps_list_add (const char *name, const char *cmdline, procstat_entry_t
 		if ((ps_list_match (name, cmdline, ps)) == 0)
 			continue;
 
-		for (pse = ps->instances; pse != NULL; pse = pse->next) {
+		for (pse = ps->instances; pse != NULL; pse = pse->next)
 			if ((pse->id == entry->id) || (pse->next == NULL))
 				break;
-		}
 
 		if ((pse == NULL) || (pse->id != entry->id))
 		{
@@ -395,11 +467,9 @@ static void ps_list_add (const char *name, const char *cmdline, procstat_entry_t
 			else
 				pse->next = new;
 
-			pse_prior = pse;
 			pse = new;
 		}
 
-		pse->prior = pse_prior;
 		pse->age = 0;
 		pse->num_proc   = entry->num_proc;
 		pse->num_lwp    = entry->num_lwp;
@@ -412,7 +482,7 @@ static void ps_list_add (const char *name, const char *cmdline, procstat_entry_t
 		pse->io_wchar   = entry->io_wchar;
 		pse->io_syscr   = entry->io_syscr;
 		pse->io_syscw   = entry->io_syscw;
-
+		
 		ps->num_proc   += pse->num_proc;
 		ps->num_lwp    += pse->num_lwp;
 		ps->vmem_size  += pse->vmem_size;
@@ -499,6 +569,25 @@ static void ps_list_add (const char *name, const char *cmdline, procstat_entry_t
 
 		ps->cpu_user_counter   += pse->cpu_user;
 		ps->cpu_system_counter += pse->cpu_system;
+
+		/* maintain averages */
+		ps->avg_num_proc   = ewma_average( pse->num_proc ,  ps->avg_num_proc);
+		ps->avg_num_lwp    = ewma_average( pse->num_lwp ,  ps->avg_num_lwp);
+		ps->avg_vmem_size  = ewma_average( pse->vmem_size ,  ps->avg_vmem_size);
+		ps->avg_vmem_rss   = ewma_average( pse->vmem_rss ,  ps->avg_vmem_rss);
+		ps->avg_vmem_data  = ewma_average( pse->vmem_data ,  ps->avg_vmem_data);
+		ps->avg_vmem_code  = ewma_average( pse->vmem_code ,  ps->avg_vmem_code);
+		ps->avg_stack_size = ewma_average( pse->stack_size ,  ps->avg_stack_size);
+		ps->avg_io_rchar   = ewma_average( pse->io_rchar ,  ps->avg_io_rchar);
+		ps->avg_io_wchar   = ewma_average( pse->io_wchar ,  ps->avg_io_wchar);
+		ps->avg_io_syscr   = ewma_average( pse->io_syscr ,  ps->avg_io_syscr);
+		ps->avg_io_syscw   = ewma_average( pse->io_syscw ,  ps->avg_io_syscw);
+
+		ps->avg_vmem_minflt_counter = ewma_average( pse->vmem_minflt_counter , ps->avg_vmem_minflt);
+		ps->avg_vmem_majflt_counter = ewma_average( pse->vmem_majflt_counter , ps->avg_vmem_majflt);
+		ps->avg_cpu_user_counter = ewma_average( pse->cpu_user_counter , ps->avg_cpu_user);
+		ps->avg_cpu_system_counter = ewma_average( pse->cpu_system_counter , ps->avg_cpu_system);
+
 	}
 }
 
@@ -557,21 +646,21 @@ static void ps_list_reset (void)
 }
 
 /* put all pre-defined 'Process' names from config to list_head_g tree */
-static int ps_config (oconfig_item_t *ci)
+static int FB_config (oconfig_item_t *ci)
 {
 	int i;
-	sstrncpy(config_mode_g,"",sizeof(""));
+	config_mode_g = 0;
 
 	for (i = 0; i < ci->children_num; ++i) {
 		oconfig_item_t *c = ci->children + i;
 
 		if (strcasecmp (c->key, "Process") == 0)
 		{
-			sstrncpy(config_mode_g,"Process",sizeof("Process"));
 			if ((c->values_num != 1)
-					|| (OCONFIG_TYPE_STRING != c->values[0].type)) {
-				ERROR ("FedBack plugin: `Process' expects exactly "
-						"one string argument (got %i).",
+					|| (OCONFIG_TYPE_STRING != c->values[0].type))
+			{
+				ERROR ("FedBack plugin: `Process' needs exactly "
+						"one string arguments (got %i).",
 						c->values_num);
 				continue;
 			}
@@ -579,15 +668,14 @@ static int ps_config (oconfig_item_t *ci)
 			if (c->children_num != 0) {
 				WARNING ("FedBack plugin: the `Process' config option "
 						"does not expect any child elements -- ignoring "
-						"content (%i elements) of the <Process '%s'> block.",
-						c->children_num, c->values[0].value.string);
+						"content (%i elements) of the <Process '%s'> "
+						"block.", c->children_num, c->values[0].value.string);
 			}
 
-			ps_list_register (c->values[0].value.string, NULL);
+			ps_list_register (c->values[0].value.string, NULL, MATCHED_PROCESS);
 		}
 		else if (strcasecmp (c->key, "ProcessMatch") == 0)
 		{
-			sstrncpy(config_mode_g,"ProcessMatch",sizeof("ProcessMatch"));
 			if ((c->values_num != 2)
 					|| (OCONFIG_TYPE_STRING != c->values[0].type)
 					|| (OCONFIG_TYPE_STRING != c->values[1].type))
@@ -606,8 +694,7 @@ static int ps_config (oconfig_item_t *ci)
 						c->values[1].value.string);
 			}
 
-			ps_list_register (c->values[0].value.string,
-					c->values[1].value.string);
+			ps_list_register (c->values[0].value.string, c->values[1].value.string, MATCHED_PROCESS);
 		}
 		else if (strcasecmp (c->key, "Processes") == 0)
 		{
@@ -618,11 +705,11 @@ static int ps_config (oconfig_item_t *ci)
 						c->values_num);
 				continue;
 			}
-			else if (strcasecmp (c->values[0].value.string, "All") == 0) {
-				sstrncpy(config_mode_g,"ProcessesAll",sizeof("ProcessesAll"));
-			}
 			else if (strcasecmp (c->values[0].value.string, "Top") == 0) {
-				sstrncpy(config_mode_g,"ProcessesTop",sizeof("ProcessesTop"));
+				config_mode_g = TOP_PROCESSES;
+			}
+			else if (strcasecmp (c->values[0].value.string, "All") == 0) {
+				config_mode_g = ALL_PROCESSES;
 			}
 			else {
 				WARNING ("FedBack plugin: `Processes' needs exactly "
@@ -644,12 +731,12 @@ static int ps_config (oconfig_item_t *ci)
 			continue;
 		}
 	}
-	WARNING ("FedBack plugin: `Processes' set mode %s", config_mode_g);
+	WARNING ("FedBack plugin: set mode %d", config_mode_g);
 
 	return (0);
 }
 
-static int ps_init (void)
+static int FB_init (void)
 {
 #if HAVE_THREAD_INFO
 	kern_return_t status;
@@ -670,7 +757,7 @@ static int ps_init (void)
 					&pset_list,
 				       	&pset_list_len)) != KERN_SUCCESS)
 	{
-		ERROR ("host_processor_sets failed: %s\n",
+		ERROR ("FedBack plugin: host_processor_sets failed: %s\n",
 			       	mach_error_string (status));
 		pset_list = NULL;
 		pset_list_len = 0;
@@ -693,7 +780,7 @@ static int ps_init (void)
 #endif /* HAVE_PROCINFO_H */
 
 	return (0);
-} /* int ps_init */
+} /* int FB_init */
 
 /* submit global state (e.g.: qty of zombies, running, etc..) */
 static void ps_submit_state (const char *state, double value)
@@ -706,7 +793,7 @@ static void ps_submit_state (const char *state, double value)
 	vl.values = values;
 	vl.values_len = 1;
 	sstrncpy (vl.host, hostname_g, sizeof (vl.host));
-	sstrncpy (vl.plugin, "FedBack", sizeof (vl.plugin));
+	sstrncpy (vl.plugin, FEDBACK_PLUGIN_NAME, sizeof (vl.plugin));
 	sstrncpy (vl.plugin_instance, "", sizeof (vl.plugin_instance));
 	sstrncpy (vl.type, "ps_state", sizeof (vl.type));
 	sstrncpy (vl.type_instance, state, sizeof (vl.type_instance));
@@ -717,56 +804,85 @@ static void ps_submit_state (const char *state, double value)
 /* submit info about specific process (e.g.: memory taken, cpu usage, etc..) */
 static void ps_submit_proc_list (procstat_t *ps)
 {
-	value_t values[2];
+	value_t values[4];
 	value_list_t vl = VALUE_LIST_INIT;
+
+	DEBUG ("name = %s top_status = %d ; num_proc = %lu; num_lwp = %lu; "
+                        "vmem_size = %lu; vmem_rss = %lu; vmem_data = %lu; "
+			"vmem_code = %lu; "
+			"vmem_minflt_counter = %"PRIi64"; vmem_majflt_counter = %"PRIi64"; "
+			"cpu_user_counter = %"PRIi64"; cpu_system_counter = %"PRIi64"; "
+			"io_rchar = %"PRIi64"; io_wchar = %"PRIi64"; "
+			"io_syscr = %"PRIi64"; io_syscw = %"PRIi64";",
+			ps->name, ps->top_status, ps->avg_num_proc, ps->avg_num_lwp,
+			ps->avg_vmem_size, ps->avg_vmem_rss,
+			ps->avg_vmem_data, ps->avg_vmem_code,
+			ps->avg_vmem_minflt_counter, ps->avg_vmem_majflt_counter,
+			ps->avg_cpu_user_counter, ps->avg_cpu_system_counter,
+			ps->avg_io_rchar, ps->avg_io_wchar, ps->avg_io_syscr, ps->avg_io_syscw);
+
+	/* return if process is not a top process */
+	if (ps->top_status == 0) 
+		return;
 
 	vl.values = values;
 	vl.values_len = 2;
 	sstrncpy (vl.host, hostname_g, sizeof (vl.host));
-	sstrncpy (vl.plugin, "FedBack", sizeof (vl.plugin));
+	sstrncpy (vl.plugin, FEDBACK_PLUGIN_NAME, sizeof (vl.plugin));
 	sstrncpy (vl.plugin_instance, ps->name, sizeof (vl.plugin_instance));
 
 	sstrncpy (vl.type, "ps_vm", sizeof (vl.type));
 	vl.values[0].gauge = ps->vmem_size;
-	vl.values_len = 1;
+	vl.values[1].gauge = ps->vmem_size;
+	vl.values_len = 2;
 	plugin_dispatch_values (&vl);
 
 	sstrncpy (vl.type, "ps_rss", sizeof (vl.type));
 	vl.values[0].gauge = ps->vmem_rss;
-	vl.values_len = 1;
+	vl.values[1].gauge = ps->vmem_rss;
+	vl.values_len = 2;
 	plugin_dispatch_values (&vl);
 
 	sstrncpy (vl.type, "ps_data", sizeof (vl.type));
 	vl.values[0].gauge = ps->vmem_data;
-	vl.values_len = 1;
+	vl.values[1].gauge = ps->vmem_data;
+	vl.values_len = 2;
 	plugin_dispatch_values (&vl);
 
 	sstrncpy (vl.type, "ps_code", sizeof (vl.type));
 	vl.values[0].gauge = ps->vmem_code;
-	vl.values_len = 1;
+	vl.values[1].gauge = ps->vmem_code;
+	vl.values_len = 2;
 	plugin_dispatch_values (&vl);
 
 	sstrncpy (vl.type, "ps_stacksize", sizeof (vl.type));
 	vl.values[0].gauge = ps->stack_size;
-	vl.values_len = 1;
+	vl.values[1].gauge = ps->stack_size;
+	vl.values_len = 2;
 	plugin_dispatch_values (&vl);
 
 	sstrncpy (vl.type, "ps_cputime", sizeof (vl.type));
 	vl.values[0].derive = ps->cpu_user_counter;
 	vl.values[1].derive = ps->cpu_system_counter;
-	vl.values_len = 2;
+	vl.values[2].derive = ps->cpu_user_counter;
+	vl.values[3].derive = ps->cpu_system_counter;
+	vl.values_len = 4;
 	plugin_dispatch_values (&vl);
 
 	sstrncpy (vl.type, "ps_count", sizeof (vl.type));
 	vl.values[0].gauge = ps->num_proc;
 	vl.values[1].gauge = ps->num_lwp;
-	vl.values_len = 2;
+	vl.values[2].gauge = ps->num_proc;
+	vl.values[3].gauge = ps->num_lwp;
+	vl.values_len = 4;
 	plugin_dispatch_values (&vl);
 
 	sstrncpy (vl.type, "ps_pagefaults", sizeof (vl.type));
 	vl.values[0].derive = ps->vmem_minflt_counter;
 	vl.values[1].derive = ps->vmem_majflt_counter;
-	vl.values_len = 2;
+	vl.values[2].derive = ps->vmem_minflt_counter;
+	vl.values[3].derive = ps->vmem_majflt_counter;
+	vl.values_len = 4;
 	plugin_dispatch_values (&vl);
 
 	if ( (ps->io_rchar != -1) && (ps->io_wchar != -1) )
@@ -774,7 +890,9 @@ static void ps_submit_proc_list (procstat_t *ps)
 		sstrncpy (vl.type, "ps_disk_octets", sizeof (vl.type));
 		vl.values[0].derive = ps->io_rchar;
 		vl.values[1].derive = ps->io_wchar;
-		vl.values_len = 2;
+		vl.values[2].derive = ps->io_rchar;
+		vl.values[3].derive = ps->io_wchar;
+		vl.values_len = 4;
 		plugin_dispatch_values (&vl);
 	}
 
@@ -783,28 +901,17 @@ static void ps_submit_proc_list (procstat_t *ps)
 		sstrncpy (vl.type, "ps_disk_ops", sizeof (vl.type));
 		vl.values[0].derive = ps->io_syscr;
 		vl.values[1].derive = ps->io_syscw;
-		vl.values_len = 2;
+		vl.values[2].derive = ps->io_syscr;
+		vl.values[3].derive = ps->io_syscw;
+		vl.values_len = 4;
 		plugin_dispatch_values (&vl);
 	}
 
-	DEBUG ("name = %s; num_proc = %lu; num_lwp = %lu; "
-                        "vmem_size = %lu; vmem_rss = %lu; vmem_data = %lu; "
-			"vmem_code = %lu; "
-			"vmem_minflt_counter = %"PRIi64"; vmem_majflt_counter = %"PRIi64"; "
-			"cpu_user_counter = %"PRIi64"; cpu_system_counter = %"PRIi64"; "
-			"io_rchar = %"PRIi64"; io_wchar = %"PRIi64"; "
-			"io_syscr = %"PRIi64"; io_syscw = %"PRIi64";",
-			ps->name, ps->num_proc, ps->num_lwp,
-			ps->vmem_size, ps->vmem_rss,
-			ps->vmem_data, ps->vmem_code,
-			ps->vmem_minflt_counter, ps->vmem_majflt_counter,
-			ps->cpu_user_counter, ps->cpu_system_counter,
-			ps->io_rchar, ps->io_wchar, ps->io_syscr, ps->io_syscw);
 } /* void ps_submit_proc_list */
 
 /* ------- additional functions for KERNEL_LINUX/HAVE_THREAD_INFO ------- */
 #if KERNEL_LINUX
-static int ps_read_tasks (int pid)
+static int FB_read_tasks (int pid)
 {
 	char           dirname[64];
 	DIR           *dh;
@@ -829,10 +936,10 @@ static int ps_read_tasks (int pid)
 	closedir (dh);
 
 	return ((count >= 1) ? count : 1);
-} /* int *ps_read_tasks */
+} /* int *FB_read_tasks */
 
 /* Read advanced virtual memory data from /proc/pid/status */
-static procstat_t *ps_read_vmem (int pid, procstat_t *ps)
+static procstat_t *FB_read_vmem (int pid, procstat_t *ps)
 {
 	FILE *fh;
 	char buffer[1024];
@@ -892,9 +999,9 @@ static procstat_t *ps_read_vmem (int pid, procstat_t *ps)
 	ps->vmem_code = (exe + lib) * 1024;
 
 	return (ps);
-} /* procstat_t *ps_read_vmem */
+} /* procstat_t *FB_read_vmem */
 
-static procstat_t *ps_read_io (int pid, procstat_t *ps)
+static procstat_t *FB_read_io (int pid, procstat_t *ps)
 {
 	FILE *fh;
 	char buffer[1024];
@@ -947,9 +1054,9 @@ static procstat_t *ps_read_io (int pid, procstat_t *ps)
 	}
 
 	return (ps);
-} /* procstat_t *ps_read_io */
+} /* procstat_t *FB_read_io */
 
-int ps_read_process (int pid, procstat_t *ps, char *state)
+int FB_read_process (int pid, procstat_t *ps, char *state)
 {
 	char  filename[64];
 	char  buffer[1024];
@@ -1017,7 +1124,7 @@ int ps_read_process (int pid, procstat_t *ps, char *state)
 	fields_len = strsplit (buffer_ptr, fields, STATIC_ARRAY_SIZE (fields));
 	if (fields_len < 22)
 	{
-		DEBUG ("FedBack plugin: ps_read_process (pid = %i):"
+		DEBUG ("FedBack plugin: FB_read_process (pid = %i):"
 				" `%s' has only %i fields..",
 				(int) pid, filename, fields_len);
 		return (-1);
@@ -1032,7 +1139,7 @@ int ps_read_process (int pid, procstat_t *ps, char *state)
 	}
 	else
 	{
-		if ( (ps->num_lwp = ps_read_tasks (pid)) == -1 )
+		if ( (ps->num_lwp = FB_read_tasks (pid)) == -1 )
 		{
 			/* returns -1 => kernel 2.4 */
 			ps->num_lwp = 1;
@@ -1069,12 +1176,12 @@ int ps_read_process (int pid, procstat_t *ps, char *state)
 	cpu_system_counter = cpu_system_counter * 1000000 / CONFIG_HZ;
 	vmem_rss = vmem_rss * pagesize_g;
 
-	if ( (ps_read_vmem(pid, ps)) == NULL)
+	if ( (FB_read_vmem(pid, ps)) == NULL)
 	{
 		/* No VMem data */
 		ps->vmem_data = -1;
 		ps->vmem_code = -1;
-		DEBUG("ps_read_process: did not get vmem data for pid %i",pid);
+		DEBUG("FB_read_process: did not get vmem data for pid %i",pid);
 	}
 
 	ps->cpu_user_counter = cpu_user_counter;
@@ -1083,7 +1190,7 @@ int ps_read_process (int pid, procstat_t *ps, char *state)
 	ps->vmem_rss = (unsigned long) vmem_rss;
 	ps->stack_size = (unsigned long) stack_size;
 
-	if ( (ps_read_io (pid, ps)) == NULL)
+	if ( (FB_read_io (pid, ps)) == NULL)
 	{
 		/* no io data */
 		ps->io_rchar = -1;
@@ -1091,12 +1198,12 @@ int ps_read_process (int pid, procstat_t *ps, char *state)
 		ps->io_syscr = -1;
 		ps->io_syscw = -1;
 
-		DEBUG("ps_read_process: not get io data for pid %i",pid);
+		DEBUG("FB_read_process: not get io data for pid %i",pid);
 	}
 
 	/* success */
 	return (0);
-} /* int ps_read_process (...) */
+} /* int FB_read_process (...) */
 
 static char *ps_get_cmdline (pid_t pid, char *name, char *buf, size_t buf_len)
 {
@@ -1217,7 +1324,7 @@ static unsigned long read_fork_rate ()
 		if (numfields != 2)
 			continue;
 
-		if (strcmp ("FedBack", fields[0]) != 0)
+		if (strcmp ("processes", fields[0]) != 0)
 			continue;
 
 		errno = 0;
@@ -1240,15 +1347,17 @@ static unsigned long read_fork_rate ()
 
 static void ps_submit_fork_rate (unsigned long value)
 {
-	value_t values[1];
+	value_t values[2];
 	value_list_t vl = VALUE_LIST_INIT;
 
 	values[0].derive = (derive_t) value;
+	avg_fork_rate_g = ewma_average(value, avg_fork_rate_g);
+	values[1].derive = (derive_t) avg_fork_rate_g;
 
 	vl.values = values;
-	vl.values_len = 1;
+	vl.values_len = 2;
 	sstrncpy (vl.host, hostname_g, sizeof (vl.host));
-	sstrncpy (vl.plugin, "FedBack", sizeof (vl.plugin));
+	sstrncpy (vl.plugin, FEDBACK_PLUGIN_NAME, sizeof (vl.plugin));
 	sstrncpy (vl.plugin_instance, "", sizeof (vl.plugin_instance));
 	sstrncpy (vl.type, "fork_rate", sizeof (vl.type));
 	sstrncpy (vl.type_instance, "", sizeof (vl.type_instance));
@@ -1296,7 +1405,7 @@ static int mach_get_task_name (task_t t, int *pid, char *name, size_t name_max_l
 /* ------- end of additional functions for KERNEL_LINUX/HAVE_THREAD_INFO ------- */
 
 /* do actual readings from kernel */
-static int ps_read (void)
+static int FB_read (void)
 {
 #if HAVE_THREAD_INFO
 	kern_return_t            status;
@@ -1326,6 +1435,11 @@ static int ps_read (void)
 	procstat_t *ps;
 	procstat_entry_t pse;
 
+	/* handle time */
+	now_g = cdtime();
+	if (then_g == 0)
+		then_g = now_g - (cdtime_t)1;
+
 	ps_list_reset ();
 
 	/*
@@ -1342,7 +1456,7 @@ static int ps_read (void)
 						pset_list[pset],
 						&port_pset_priv)) != KERN_SUCCESS)
 		{
-			ERROR ("host_processor_set_priv failed: %s\n",
+			ERROR ("FedBack plugin: host_processor_set_priv failed: %s\n",
 					mach_error_string (status));
 			continue;
 		}
@@ -1351,7 +1465,7 @@ static int ps_read (void)
 						&task_list,
 						&task_list_len)) != KERN_SUCCESS)
 		{
-			ERROR ("processor_set_tasks failed: %s\n",
+			ERROR ("FedBack plugin: processor_set_tasks failed: %s\n",
 					mach_error_string (status));
 			mach_port_deallocate (port_task_self, port_pset_priv);
 			continue;
@@ -1364,7 +1478,6 @@ static int ps_read (void)
 						&task_pid,
 						task_name, PROCSTAT_NAME_LEN) == 0)
 			{
-				ERROR ("got task name: %s\n", task_name);
 				/* search for at least one match */
 				for (ps = list_head_g; ps != NULL; ps = ps->next)
 					/* FIXME: cmdline should be here instead of NULL */
@@ -1392,7 +1505,7 @@ static int ps_read (void)
 						&task_basic_info_len);
 				if (status != KERN_SUCCESS)
 				{
-					ERROR ("task_info failed: %s",
+					ERROR ("FedBack plugin: task_info failed: %s",
 							mach_error_string (status));
 					continue; /* with next thread_list */
 				}
@@ -1404,7 +1517,7 @@ static int ps_read (void)
 						&task_events_info_len);
 				if (status != KERN_SUCCESS)
 				{
-					ERROR ("task_info failed: %s",
+					ERROR ("FedBack plugin: task_info failed: %s",
 							mach_error_string (status));
 					continue; /* with next thread_list */
 				}
@@ -1416,7 +1529,7 @@ static int ps_read (void)
 						&task_absolutetime_info_len);
 				if (status != KERN_SUCCESS)
 				{
-					ERROR ("task_info failed: %s",
+					ERROR ("FedBack plugin: task_info failed: %s",
 							mach_error_string (status));
 					continue; /* with next thread_list */
 				}
@@ -1461,7 +1574,7 @@ static int ps_read (void)
 						&thread_data_len);
 				if (status != KERN_SUCCESS)
 				{
-					ERROR ("thread_info failed: %s",
+					ERROR ("FedBack plugin: thread_info failed: %s",
 							mach_error_string (status));
 					if (task_list[task] != port_task_self)
 						mach_port_deallocate (port_task_self,
@@ -1503,7 +1616,7 @@ static int ps_read (void)
 					status = mach_port_deallocate (port_task_self,
 							thread_list[thread]);
 					if (status != KERN_SUCCESS)
-						ERROR ("mach_port_deallocate failed: %s",
+						ERROR ("FedBack plugin: mach_port_deallocate failed: %s",
 								mach_error_string (status));
 				}
 			} /* for (thread_list) */
@@ -1513,7 +1626,7 @@ static int ps_read (void)
 							thread_list_len * sizeof (thread_act_t)))
 					!= KERN_SUCCESS)
 			{
-				ERROR ("vm_deallocate failed: %s",
+				ERROR ("FedBack plugin: vm_deallocate failed: %s",
 						mach_error_string (status));
 			}
 			thread_list = NULL;
@@ -1527,7 +1640,7 @@ static int ps_read (void)
 				status = mach_port_deallocate (port_task_self,
 						task_list[task]);
 				if (status != KERN_SUCCESS)
-					ERROR ("mach_port_deallocate failed: %s",
+					ERROR ("FedBack plugin: mach_port_deallocate failed: %s",
 							mach_error_string (status));
 			}
 
@@ -1540,7 +1653,7 @@ static int ps_read (void)
 				(vm_address_t) task_list,
 				task_list_len * sizeof (task_t))) != KERN_SUCCESS)
 		{
-			ERROR ("vm_deallocate failed: %s",
+			ERROR ("FedBack plugin: vm_deallocate failed: %s",
 					mach_error_string (status));
 		}
 		task_list = NULL;
@@ -1549,17 +1662,25 @@ static int ps_read (void)
 		if ((status = mach_port_deallocate (port_task_self, port_pset_priv))
 				!= KERN_SUCCESS)
 		{
-			ERROR ("mach_port_deallocate failed: %s",
+			ERROR ("FedBack plugin: mach_port_deallocate failed: %s",
 					mach_error_string (status));
 		}
 	} /* for (pset_list) */
 
+	/* average process counts */
+	avg_process_count_g = ewma_average(process_count_g,avg_process_count_g);
+	avg_top_process_count_g = ewma_average(top_process_count_g,avg_top_process_count_g);
+
+	/* submit process count information */
+	ps_submit_state ("top", avg_top_process_count_g);
+	ps_submit_state ("total", avg_process_count_g);
 	ps_submit_state ("running", running);
 	ps_submit_state ("sleeping", sleeping);
 	ps_submit_state ("zombies", zombies);
 	ps_submit_state ("stopped", stopped);
 	ps_submit_state ("blocked", blocked);
 
+	/* submit process details information */
 	for (ps = list_head_g; ps != NULL; ps = ps->next)
 		ps_submit_proc_list (ps);
 /* #endif HAVE_THREAD_INFO */
@@ -1593,7 +1714,7 @@ static int ps_read (void)
 	if ((proc = opendir ("/proc")) == NULL)
 	{
 		char errbuf[1024];
-		ERROR ("Cannot open `/proc': %s",
+		ERROR ("FedBack plugin: Cannot open `/proc': %s",
 				sstrerror (errno, errbuf, sizeof (errbuf)));
 		return (-1);
 	}
@@ -1606,10 +1727,10 @@ static int ps_read (void)
 		if ((pid = atoi (ent->d_name)) < 1)
 			continue;
 
-		status = ps_read_process (pid, &ps, &state);
+		status = FB_read_process (pid, &ps, &state);
 		if (status != 0)
 		{
-			DEBUG ("ps_read_process failed: %i", status);
+			DEBUG ("FB_read_process failed: %i", status);
 			continue;
 		}
 
@@ -1656,6 +1777,13 @@ static int ps_read (void)
 
 	closedir (proc);
 
+	/* average top process count */
+	avg_process_count_g = ewma_average(process_count_g,avg_process_count_g);
+	avg_top_process_count_g = ewma_average(top_process_count_g,avg_top_process_count_g);
+
+	/* submit process count information */
+	ps_submit_state ("top", avg_top_process_count_g);
+	ps_submit_state ("total", avg_process_count_g);
 	ps_submit_state ("running",  running);
 	ps_submit_state ("sleeping", sleeping);
 	ps_submit_state ("zombies",  zombies);
@@ -1663,6 +1791,7 @@ static int ps_read (void)
 	ps_submit_state ("paging",   paging);
 	ps_submit_state ("blocked",  blocked);
 
+	/* submit process detail information */
 	for (ps_ptr = list_head_g; ps_ptr != NULL; ps_ptr = ps_ptr->next)
 		ps_submit_proc_list (ps_ptr);
 
@@ -1803,6 +1932,13 @@ static int ps_read (void)
 
 	kvm_close(kd);
 
+	/* average top process count */
+	avg_process_count_g = ewma_average(process_count_g,avg_process_count_g);
+	avg_top_process_count_g = ewma_average(top_process_count_g,avg_top_process_count_g);
+
+	/* submit process count information */
+	ps_submit_state ("top", avg_top_process_count_g);
+	ps_submit_state ("total", avg_process_count_g);
 	ps_submit_state ("running",  running);
 	ps_submit_state ("sleeping", sleeping);
 	ps_submit_state ("zombies",  zombies);
@@ -1811,6 +1947,7 @@ static int ps_read (void)
 	ps_submit_state ("idle",     idle);
 	ps_submit_state ("wait",     wait);
 
+	/* submit process detail information */
 	for (ps_ptr = list_head_g; ps_ptr != NULL; ps_ptr = ps_ptr->next)
 		ps_submit_proc_list (ps_ptr);
 /* #endif HAVE_LIBKVM_GETPROCS && HAVE_STRUCT_KINFO_PROC_FREEBSD */
@@ -1938,6 +2075,14 @@ static int ps_read (void)
 		if (nprocs < MAXPROCENTRY)
 			break;
 	} /* while (getprocs64() > 0) */
+	
+	/* average top process count */
+	avg_process_count_g = ewma_average(process_count_g,avg_process_count_g);
+	avg_top_process_count_g = ewma_average(top_process_count_g,avg_top_process_count_g);
+
+	/* submit process count information */
+	ps_submit_state ("top", avg_top_process_count_g);
+	ps_submit_state ("total", avg_process_count_g);
 	ps_submit_state ("running",  running);
 	ps_submit_state ("sleeping", sleeping);
 	ps_submit_state ("zombies",  zombies);
@@ -1945,16 +2090,20 @@ static int ps_read (void)
 	ps_submit_state ("paging",   paging);
 	ps_submit_state ("blocked",  blocked);
 
+	/* submit process detail information */
 	for (ps = list_head_g; ps != NULL; ps = ps->next)
 		ps_submit_proc_list (ps);
 #endif /* HAVE_PROCINFO_H */
 
+	/* handle time */
+	then_g = now_g;
+
 	return (0);
-} /* int ps_read */
+} /* int FB_read */
 
 void module_register (void)
 {
-	plugin_register_complex_config ("FedBack", ps_config);
-	plugin_register_init ("FedBack", ps_init);
-	plugin_register_read ("FedBack", ps_read);
+	plugin_register_complex_config (FEDBACK_PLUGIN_NAME, FB_config);
+	plugin_register_init (FEDBACK_PLUGIN_NAME, FB_init);
+	plugin_register_read (FEDBACK_PLUGIN_NAME, FB_read);
 } /* void module_register */
